@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import uuid
+import ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -160,10 +161,22 @@ def find_all_targets_by_name(filename, config):
 def open_path(target_path):
     target_path = Path(target_path)
     suffix = target_path.suffix.lower()
+    if suffix == ".lnk":
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "open",
+            str(target_path),
+            None,
+            str(target_path.parent),
+            1,
+        )
+        if result <= 32:
+            raise OSError(f"ShellExecute failed: {result}")
+        return
     if target_path.is_dir():
         subprocess.Popen(["explorer.exe", str(target_path)], cwd=str(BASE_DIR), shell=False)
         return
-    if suffix in {".lnk", ".exe", ".bat", ".cmd"}:
+    if suffix in {".exe", ".bat", ".cmd"}:
         subprocess.Popen(
             ["cmd.exe", "/c", "start", "", str(target_path)],
             cwd=str(target_path.parent),
@@ -198,7 +211,15 @@ def run_builtin_open_file(script_name, args, config, run_id):
             "stdout": f"Exact path: {exact_path}",
         }
 
-    open_path(target_path)
+    try:
+        open_path(target_path)
+    except OSError as exc:
+        return 500, {
+            "ok": False,
+            "run_id": run_id,
+            "error": str(exc),
+            "stdout": f"Target: {target_path}",
+        }
     return 200, {
         "ok": True,
         "run_id": run_id,
@@ -237,7 +258,15 @@ def run_builtin_open_file_search(args, config, run_id):
             ),
         }
 
-    open_path(target_path)
+    try:
+        open_path(target_path)
+    except OSError as exc:
+        return 500, {
+            "ok": False,
+            "run_id": run_id,
+            "error": str(exc),
+            "stdout": f"Target: {target_path}",
+        }
     return 200, {
         "ok": True,
         "run_id": run_id,
