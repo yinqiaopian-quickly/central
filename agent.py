@@ -397,13 +397,53 @@ def cmd_start_open(target_path):
                 pass
 
 
+def simulated_explorer_activate(target_path):
+    target_path = Path(target_path)
+    script = (
+        'Set shell = CreateObject("WScript.Shell")\n'
+        f'shell.Run "explorer.exe /select,""{target_path}""", 1, False\n'
+        "WScript.Sleep 1600\n"
+        'shell.SendKeys "{ENTER}"\n'
+        "WScript.Sleep 300\n"
+    )
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".vbs", delete=False, encoding="mbcs") as file:
+            file.write(script)
+            script_path = file.name
+        completed = subprocess.run(
+            ["cscript.exe", "//nologo", script_path],
+            cwd=str(target_path.parent if target_path.parent.exists() else BASE_DIR),
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=8,
+        )
+        accepted = completed.returncode == 0
+        return {
+            "accepted": accepted,
+            "confirmed_open": accepted,
+            "launch_state": f"simulated_enter_returned:{completed.returncode}",
+            "activation_method": "explorer_select_enter",
+            "activation_script": f'explorer.exe /select,"{target_path}" -> SendKeys ENTER',
+            "cmd_stdout": completed.stdout.strip(),
+            "cmd_stderr": completed.stderr.strip(),
+        }
+    finally:
+        if script_path:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+
+
 def open_path(target_path):
     target_path = Path(target_path)
     suffix = target_path.suffix.lower()
     if suffix == ".lnk":
         candidates, shortcut_details = extract_lnk_exe_candidates(target_path)
         process_names = process_names_from_paths(candidates)
-        result = cmd_start_open(target_path)
+        result = simulated_explorer_activate(target_path)
         if candidates:
             result["target_candidates"] = candidates[:5]
         if process_names:
@@ -417,7 +457,7 @@ def open_path(target_path):
         if shortcut_details.get("ShortcutError"):
             result["shortcut_error"] = shortcut_details["ShortcutError"]
         return result
-    result = cmd_start_open(target_path)
+    result = simulated_explorer_activate(target_path)
     if suffix == ".exe":
         result["target_process_names"] = [target_path.name]
     return result
@@ -435,6 +475,8 @@ def build_open_response(run_id, target_path, launch_result):
         "launch_state": launch_result.get("launch_state", ""),
         "cmd": launch_result.get("cmd", ""),
         "cmd_script": launch_result.get("cmd_script", ""),
+        "activation_method": launch_result.get("activation_method", ""),
+        "activation_script": launch_result.get("activation_script", ""),
         "run_id": run_id,
         "returncode": 0 if confirmed else 1,
         "stdout": "\n".join(stdout_lines),
