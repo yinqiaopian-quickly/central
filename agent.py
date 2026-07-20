@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -196,9 +197,54 @@ def unique_values(values):
     return result
 
 
+def resolve_shortcut_with_cscript(shortcut_path):
+    script = (
+        'Set shell = CreateObject("WScript.Shell")\n'
+        'Set link = shell.CreateShortcut(WScript.Arguments(0))\n'
+        'WScript.Echo "TargetPath=" & link.TargetPath\n'
+        'WScript.Echo "Arguments=" & link.Arguments\n'
+        'WScript.Echo "WorkingDirectory=" & link.WorkingDirectory\n'
+    )
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".vbs", delete=False, encoding="ascii") as file:
+            file.write(script)
+            script_path = file.name
+        output = subprocess.check_output(
+            ["cscript.exe", "//nologo", script_path, str(shortcut_path)],
+            stderr=subprocess.STDOUT,
+            timeout=8,
+        )
+        text = output.decode("mbcs", errors="ignore")
+        details = {}
+        for line in text.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                details[key] = value.strip()
+        return details
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ShortcutError": str(exc)}
+    finally:
+        if script_path:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+
+
+def extract_exe_paths_from_text(value):
+    if not value:
+        return []
+    return [match.strip().strip('"') for match in re.findall(r"[A-Za-z]:\\[^\x00\r\n\"]+?\.exe", value, flags=re.IGNORECASE)]
+
+
 def extract_lnk_exe_candidates(shortcut_path):
     data = Path(shortcut_path).read_bytes()
+    details = resolve_shortcut_with_cscript(shortcut_path)
     candidates = []
+    if details.get("TargetPath"):
+        candidates.append(details["TargetPath"])
+    candidates.extend(extract_exe_paths_from_text(details.get("Arguments", "")))
     patterns = [
         (data, rb"[A-Za-z]:\\[^\x00\r\n\"]+?\.exe"),
         (data.decode("utf-16le", errors="ignore"), r"[A-Za-z]:\\[^\x00\r\n\"]+?\.exe"),
@@ -215,7 +261,7 @@ def extract_lnk_exe_candidates(shortcut_path):
             value = value.strip().strip('"')
             if value:
                 candidates.append(value)
-    return unique_values(candidates)
+    return unique_values(candidates), details
 
 
 def running_process_names():
@@ -317,13 +363,21 @@ def open_path(target_path):
     target_path = Path(target_path)
     suffix = target_path.suffix.lower()
     if suffix == ".lnk":
-        candidates = extract_lnk_exe_candidates(target_path)
+        candidates, shortcut_details = extract_lnk_exe_candidates(target_path)
         process_names = process_names_from_paths(candidates)
         result = shell_execute_open(target_path, confirm_process_names=process_names)
         if candidates:
             result["target_candidates"] = candidates[:5]
         if process_names:
             result["target_process_names"] = process_names
+        if shortcut_details.get("TargetPath"):
+            result["shortcut_target"] = shortcut_details["TargetPath"]
+        if shortcut_details.get("Arguments"):
+            result["shortcut_arguments"] = shortcut_details["Arguments"]
+        if shortcut_details.get("WorkingDirectory"):
+            result["shortcut_working_directory"] = shortcut_details["WorkingDirectory"]
+        if shortcut_details.get("ShortcutError"):
+            result["shortcut_error"] = shortcut_details["ShortcutError"]
         return result
     if suffix == ".exe":
         return shell_execute_open(target_path, confirm_process_names=[target_path.name])

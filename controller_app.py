@@ -9,7 +9,7 @@ from controller import BASE_DIR, run_on_host
 
 HOSTS_PATH = BASE_DIR / "hosts.txt"
 AGENT_CONFIG_PATH = BASE_DIR / "agent_config.json"
-APP_VERSION = "2026.07.20-4"
+APP_VERSION = "2026.07.20-5"
 
 
 def read_json(path, default):
@@ -291,8 +291,14 @@ class ControllerApp(tk.Tk):
             lines.append(f"启动状态: {payload['launch_state']}")
         if payload.get("target_process_names"):
             lines.append("目标进程: " + ", ".join(payload["target_process_names"]))
+        if payload.get("shortcut_target"):
+            lines.append(f"快捷方式 TargetPath: {payload['shortcut_target']}")
+        if payload.get("shortcut_arguments"):
+            lines.append(f"快捷方式参数: {payload['shortcut_arguments']}")
         if payload.get("target_candidates"):
             lines.append("快捷方式目标: " + " | ".join(payload["target_candidates"]))
+        if payload.get("shortcut_error"):
+            lines.append(f"快捷方式解析错误: {payload['shortcut_error']}")
         if payload.get("stdout"):
             lines.extend(["STDOUT:", payload["stdout"].rstrip()])
         if payload.get("stderr"):
