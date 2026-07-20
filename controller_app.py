@@ -9,7 +9,7 @@ from controller import BASE_DIR, run_on_host
 
 HOSTS_PATH = BASE_DIR / "hosts.txt"
 AGENT_CONFIG_PATH = BASE_DIR / "agent_config.json"
-APP_VERSION = "2026.07.20-2"
+APP_VERSION = "2026.07.20-3"
 
 
 def read_json(path, default):
@@ -276,12 +276,19 @@ class ControllerApp(tk.Tk):
             if index < total and interval > 0:
                 self.after(0, self.append_result, f"等待 {interval:g} 秒后执行下一台...\n")
                 time.sleep(interval)
-        ok_count = sum(1 for _host, _status, payload in results if payload.get("ok"))
+        ok_count = sum(1 for _host, _status, payload in results if self.is_confirmed_open(payload))
         self.after(0, self.finish_run, results, ok_count)
 
+    def is_confirmed_open(self, payload):
+        if "confirmed_open" in payload:
+            return bool(payload.get("confirmed_open"))
+        return bool(payload.get("ok"))
+
     def format_result_block(self, host, status, payload):
-        ok = "OK" if payload.get("ok") else "FAIL"
+        ok = "OK" if self.is_confirmed_open(payload) else "FAIL"
         lines = [f"[{ok}] {host} HTTP={status}"]
+        if payload.get("launch_state"):
+            lines.append(f"启动状态: {payload['launch_state']}")
         if payload.get("stdout"):
             lines.extend(["STDOUT:", payload["stdout"].rstrip()])
         if payload.get("stderr"):
@@ -300,7 +307,11 @@ class ControllerApp(tk.Tk):
         self.summary_var.set(f"完成 {total} 台，成功 {ok_count} 台，失败 {total - ok_count} 台")
         self.run_btn.configure(state=tk.NORMAL)
         if fail_count:
-            failed = [self.format_result_block(host, status, payload) for host, status, payload in results if not payload.get("ok")]
+            failed = [
+                self.format_result_block(host, status, payload)
+                for host, status, payload in results
+                if not self.is_confirmed_open(payload)
+            ]
             messagebox.showerror("执行失败", "\n\n".join(failed[:5]))
         else:
             messagebox.showinfo("执行完成", f"成功打开 {ok_count} 台。")

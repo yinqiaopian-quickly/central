@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import json
 import os
 import subprocess
@@ -12,6 +13,30 @@ from pathlib import Path
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "agent_config.json"
 OPEN_TARGETS_PATH = BASE_DIR / "scripts" / "open_targets.json"
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+SW_SHOWNORMAL = 1
+WAIT_TIMEOUT = 0x00000102
+STILL_ACTIVE = 259
+
+
+class ShellExecuteInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("fMask", ctypes.c_ulong),
+        ("hwnd", ctypes.c_void_p),
+        ("lpVerb", ctypes.c_wchar_p),
+        ("lpFile", ctypes.c_wchar_p),
+        ("lpParameters", ctypes.c_wchar_p),
+        ("lpDirectory", ctypes.c_wchar_p),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", ctypes.c_void_p),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", ctypes.c_wchar_p),
+        ("hkeyClass", ctypes.c_void_p),
+        ("dwHotKey", ctypes.c_ulong),
+        ("hIcon", ctypes.c_void_p),
+        ("hProcess", ctypes.c_void_p),
+    ]
 
 
 def load_config():
@@ -157,27 +182,77 @@ def find_all_targets_by_name(filename, config):
     return results
 
 
+def shell_execute_open(target_path, wait_ms=2500):
+    target_path = Path(target_path)
+    info = ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(ShellExecuteInfo)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS
+    info.hwnd = None
+    info.lpVerb = "open"
+    info.lpFile = str(target_path)
+    info.lpParameters = None
+    info.lpDirectory = str(target_path.parent)
+    info.nShow = SW_SHOWNORMAL
+
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+        raise ctypes.WinError()
+
+    h_process = info.hProcess
+    if not h_process:
+        return {
+            "accepted": True,
+            "confirmed_open": False,
+            "launch_state": "sent_without_process_handle",
+        }
+
+    try:
+        wait_result = ctypes.windll.kernel32.WaitForSingleObject(h_process, wait_ms)
+        exit_code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(h_process, ctypes.byref(exit_code))
+        if wait_result == WAIT_TIMEOUT or exit_code.value == STILL_ACTIVE:
+            return {
+                "accepted": True,
+                "confirmed_open": True,
+                "launch_state": "process_running",
+            }
+        return {
+            "accepted": True,
+            "confirmed_open": False,
+            "launch_state": f"process_exited:{exit_code.value}",
+        }
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h_process)
+
+
 def open_path(target_path):
     target_path = Path(target_path)
     suffix = target_path.suffix.lower()
-    if suffix == ".lnk":
-        subprocess.Popen(
-            ["cmd.exe", "/c", "start", "", str(target_path)],
-            cwd=str(target_path.parent),
-            shell=False,
-        )
-        return
+    if suffix in {".lnk", ".exe"}:
+        return shell_execute_open(target_path)
     if target_path.is_dir():
         subprocess.Popen(["explorer.exe", str(target_path)], cwd=str(BASE_DIR), shell=False)
-        return
+        return {
+            "accepted": True,
+            "confirmed_open": False,
+            "launch_state": "explorer_sent_without_confirmation",
+        }
     if suffix in {".exe", ".bat", ".cmd"}:
         subprocess.Popen(
             ["cmd.exe", "/c", "start", "", str(target_path)],
             cwd=str(target_path.parent),
             shell=False,
         )
-        return
+        return {
+            "accepted": True,
+            "confirmed_open": False,
+            "launch_state": "cmd_start_sent_without_confirmation",
+        }
     os.startfile(str(target_path))
+    return {
+        "accepted": True,
+        "confirmed_open": False,
+        "launch_state": "startfile_sent_without_confirmation",
+    }
 
 
 def run_builtin_open_file(script_name, args, config, run_id):
@@ -206,7 +281,7 @@ def run_builtin_open_file(script_name, args, config, run_id):
         }
 
     try:
-        open_path(target_path)
+        launch_result = open_path(target_path)
     except OSError as exc:
         return 500, {
             "ok": False,
@@ -214,11 +289,15 @@ def run_builtin_open_file(script_name, args, config, run_id):
             "error": str(exc),
             "stdout": f"Target: {target_path}",
         }
+    confirmed = bool(launch_result.get("confirmed_open"))
     return 200, {
-        "ok": True,
+        "ok": confirmed,
+        "accepted": bool(launch_result.get("accepted")),
+        "confirmed_open": confirmed,
+        "launch_state": launch_result.get("launch_state", ""),
         "run_id": run_id,
         "returncode": 0,
-        "stdout": f"Opened: {target_path}",
+        "stdout": f"{'Confirmed opened' if confirmed else 'Open command sent but not confirmed'}: {target_path}",
         "stderr": "",
     }
 
@@ -253,7 +332,7 @@ def run_builtin_open_file_search(args, config, run_id):
         }
 
     try:
-        open_path(target_path)
+        launch_result = open_path(target_path)
     except OSError as exc:
         return 500, {
             "ok": False,
@@ -261,11 +340,15 @@ def run_builtin_open_file_search(args, config, run_id):
             "error": str(exc),
             "stdout": f"Target: {target_path}",
         }
+    confirmed = bool(launch_result.get("confirmed_open"))
     return 200, {
-        "ok": True,
+        "ok": confirmed,
+        "accepted": bool(launch_result.get("accepted")),
+        "confirmed_open": confirmed,
+        "launch_state": launch_result.get("launch_state", ""),
         "run_id": run_id,
         "returncode": 0,
-        "stdout": f"Opened: {target_path}",
+        "stdout": f"{'Confirmed opened' if confirmed else 'Open command sent but not confirmed'}: {target_path}",
         "stderr": "",
     }
 
