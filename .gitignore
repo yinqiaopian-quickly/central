@@ -5,7 +5,3 @@ build/
 dist/
 *.spec
 .tools/
-release/
-release_win7/
-release.zip
-release_win7.zip

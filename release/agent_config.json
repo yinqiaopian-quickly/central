@@ -1,0 +1,24 @@
+{
+  "token": "change-this-token",
+  "default_timeout_seconds": 120,
+  "file_search_roots": [
+    ".",
+    "%USERPROFILE%\\Desktop",
+    "%USERPROFILE%\\Documents",
+    "%USERPROFILE%\\Downloads",
+    "%PUBLIC%\\Desktop",
+    "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs",
+    "%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs",
+    "%PROGRAMFILES%",
+    "%PROGRAMFILES(X86)%"
+  ],
+  "file_search_max_seconds": 45,
+  "file_search_max_dirs": 5000,
+  "file_search_max_results": 20,
+  "scripts": {
+    "open_file_search": {
+      "builtin": "open_file_search",
+      "timeout_seconds": 60
+    }
+  }
+}
