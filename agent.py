@@ -157,6 +157,22 @@ def find_all_targets_by_name(filename, config):
     return results
 
 
+def open_path(target_path):
+    target_path = Path(target_path)
+    suffix = target_path.suffix.lower()
+    if target_path.is_dir():
+        subprocess.Popen(["explorer.exe", str(target_path)], cwd=str(BASE_DIR), shell=False)
+        return
+    if suffix in {".lnk", ".exe", ".bat", ".cmd"}:
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", "", str(target_path)],
+            cwd=str(target_path.parent),
+            shell=False,
+        )
+        return
+    os.startfile(str(target_path))
+
+
 def run_builtin_open_file(script_name, args, config, run_id):
     if not args:
         return 400, {"ok": False, "run_id": run_id, "error": "missing_target_name"}
@@ -182,7 +198,7 @@ def run_builtin_open_file(script_name, args, config, run_id):
             "stdout": f"Exact path: {exact_path}",
         }
 
-    os.startfile(str(target_path))
+    open_path(target_path)
     return 200, {
         "ok": True,
         "run_id": run_id,
@@ -221,7 +237,7 @@ def run_builtin_open_file_search(args, config, run_id):
             ),
         }
 
-    os.startfile(str(target_path))
+    open_path(target_path)
     return 200, {
         "ok": True,
         "run_id": run_id,
