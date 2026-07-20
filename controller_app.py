@@ -1,7 +1,7 @@
 import json
 import threading
+import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import messagebox, ttk
 
 from controller import BASE_DIR, run_on_host
@@ -43,13 +43,13 @@ class ControllerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("主控端")
-        self.geometry("940x620")
-        self.minsize(820, 540)
+        self.geometry("940x640")
+        self.minsize(820, 560)
 
         self.token_var = tk.StringVar()
         self.file_name_var = tk.StringVar()
         self.host_input_var = tk.StringVar()
-        self.parallel_var = tk.StringVar(value="16")
+        self.interval_var = tk.StringVar(value="5")
         self.timeout_var = tk.StringVar(value="180")
         self.summary_var = tk.StringVar(value="等待执行")
         self.host_selected = {}
@@ -83,9 +83,9 @@ class ControllerApp(tk.Tk):
 
         grid = ttk.Frame(left)
         grid.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(grid, text="并发").grid(row=0, column=0, sticky=tk.W)
-        ttk.Label(grid, text="超时秒数").grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
-        ttk.Entry(grid, textvariable=self.parallel_var, width=10).grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
+        ttk.Label(grid, text="启动间隔秒数").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(grid, text="单台超时秒数").grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
+        ttk.Entry(grid, textvariable=self.interval_var, width=10).grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
         ttk.Entry(grid, textvariable=self.timeout_var, width=10).grid(row=1, column=1, sticky=tk.EW, padx=(10, 0), pady=(4, 0))
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
@@ -98,7 +98,7 @@ class ControllerApp(tk.Tk):
         host_entry.bind("<Return>", lambda _event: self.add_host())
         ttk.Button(add_row, text="添加", command=self.add_host).pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(left, text="勾选要操作的主机").pack(anchor=tk.W)
+        ttk.Label(left, text="勾选要操作的主机，双击或按空格切换").pack(anchor=tk.W)
         table_wrap = ttk.Frame(left)
         table_wrap.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
         self.host_tree = ttk.Treeview(
@@ -111,7 +111,7 @@ class ControllerApp(tk.Tk):
         self.host_tree.heading("selected", text="选择")
         self.host_tree.heading("host", text="主机")
         self.host_tree.column("selected", width=54, anchor=tk.CENTER, stretch=False)
-        self.host_tree.column("host", width=230, anchor=tk.W)
+        self.host_tree.column("host", width=250, anchor=tk.W)
         self.host_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=self.host_tree.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -125,7 +125,7 @@ class ControllerApp(tk.Tk):
         ttk.Button(host_buttons, text="反选", command=self.invert_hosts).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(host_buttons, text="删除", command=self.delete_selected_host).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(host_buttons, text="保存", command=self.save_hosts).pack(side=tk.LEFT, padx=(8, 0))
-        self.run_btn = ttk.Button(host_buttons, text="搜索并打开", command=self.run_task)
+        self.run_btn = ttk.Button(host_buttons, text="逐台搜索并打开", command=self.run_task)
         self.run_btn.pack(side=tk.RIGHT)
 
         ttk.Label(right, textvariable=self.summary_var).pack(anchor=tk.W)
@@ -231,34 +231,34 @@ class ControllerApp(tk.Tk):
             return
 
         try:
-            parallel = max(1, min(int(self.parallel_var.get()), 64))
+            interval = max(0, float(self.interval_var.get()))
             timeout = max(5, int(self.timeout_var.get()))
         except ValueError:
-            messagebox.showwarning("参数错误", "并发和超时必须是数字。")
+            messagebox.showwarning("参数错误", "启动间隔和超时必须是数字。")
             return
 
         self.save_hosts(show_status=False)
         self.run_btn.configure(state=tk.DISABLED)
         self.result_text.delete("1.0", tk.END)
-        self.summary_var.set(f"正在对 {len(hosts)} 台主机执行...")
+        self.summary_var.set(f"正在逐台执行，共 {len(hosts)} 台...")
         thread = threading.Thread(
             target=self.run_worker,
-            args=(hosts, self.token_var.get(), filename, parallel, timeout),
+            args=(hosts, self.token_var.get(), filename, interval, timeout),
             daemon=True,
         )
         thread.start()
 
-    def run_worker(self, hosts, token, filename, parallel, timeout):
+    def run_worker(self, hosts, token, filename, interval, timeout):
         results = []
-        with ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = [
-                executor.submit(run_on_host, host, token, "open_file_search", [filename], timeout)
-                for host in hosts
-            ]
-            for future in as_completed(futures):
-                host, status, payload = future.result()
-                results.append((host, status, payload))
-                self.after(0, self.render_one_result, host, status, payload)
+        total = len(hosts)
+        for index, host in enumerate(hosts, start=1):
+            self.after(0, self.append_result, f"正在执行第 {index}/{total} 台：{host}")
+            host, status, payload = run_on_host(host, token, "open_file_search", [filename], timeout)
+            results.append((host, status, payload))
+            self.after(0, self.render_one_result, host, status, payload)
+            if index < total and interval > 0:
+                self.after(0, self.append_result, f"等待 {interval:g} 秒后执行下一台...\n")
+                time.sleep(interval)
         ok_count = sum(1 for _host, _status, payload in results if payload.get("ok"))
         self.after(0, self.finish_run, len(results), ok_count)
 

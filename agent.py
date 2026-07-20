@@ -71,11 +71,11 @@ def candidate_search_roots(config):
 def normalize_match_text(value):
     return (
         value.lower()
-        .replace("：", ":")
+        .replace("\uff1a", ":")
         .replace(" ", "")
         .replace("_", "")
         .replace("-", "")
-        .replace("·", "")
+        .replace("\u00b7", "")
     )
 
 
