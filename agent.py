@@ -1,7 +1,10 @@
 import argparse
+import csv
 import ctypes
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -182,8 +185,82 @@ def find_all_targets_by_name(filename, config):
     return results
 
 
-def shell_execute_open(target_path, wait_ms=2500):
+def unique_values(values):
+    seen = set()
+    result = []
+    for value in values:
+        key = value.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
+
+def extract_lnk_exe_candidates(shortcut_path):
+    data = Path(shortcut_path).read_bytes()
+    candidates = []
+    patterns = [
+        (data, rb"[A-Za-z]:\\[^\x00\r\n\"]+?\.exe"),
+        (data.decode("utf-16le", errors="ignore"), r"[A-Za-z]:\\[^\x00\r\n\"]+?\.exe"),
+    ]
+    for source, pattern in patterns:
+        for match in re.findall(pattern, source, flags=re.IGNORECASE):
+            if isinstance(match, bytes):
+                try:
+                    value = match.decode("mbcs", errors="ignore")
+                except LookupError:
+                    value = match.decode(errors="ignore")
+            else:
+                value = match
+            value = value.strip().strip('"')
+            if value:
+                candidates.append(value)
+    return unique_values(candidates)
+
+
+def running_process_names():
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/fo", "csv", "/nh"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="ignore",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+    names = set()
+    for row in csv.reader(io.StringIO(output)):
+        if row:
+            names.add(row[0].lower())
+    return names
+
+
+def process_names_from_paths(paths):
+    return unique_values([Path(path).name for path in paths if Path(path).suffix.lower() == ".exe"])
+
+
+def any_process_running(process_names):
+    if not process_names:
+        return False
+    running = running_process_names()
+    return any(name.lower() in running for name in process_names)
+
+
+def wait_for_process(process_names, timeout_seconds=8):
+    if not process_names:
+        return False
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() <= deadline:
+        if any_process_running(process_names):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def shell_execute_open(target_path, wait_ms=2500, confirm_process_names=None):
     target_path = Path(target_path)
+    confirm_process_names = confirm_process_names or []
     info = ShellExecuteInfo()
     info.cbSize = ctypes.sizeof(ShellExecuteInfo)
     info.fMask = SEE_MASK_NOCLOSEPROCESS
@@ -199,6 +276,12 @@ def shell_execute_open(target_path, wait_ms=2500):
 
     h_process = info.hProcess
     if not h_process:
+        if wait_for_process(confirm_process_names):
+            return {
+                "accepted": True,
+                "confirmed_open": True,
+                "launch_state": "target_process_running_without_handle",
+            }
         return {
             "accepted": True,
             "confirmed_open": False,
@@ -215,6 +298,12 @@ def shell_execute_open(target_path, wait_ms=2500):
                 "confirmed_open": True,
                 "launch_state": "process_running",
             }
+        if exit_code.value == 0 and wait_for_process(confirm_process_names):
+            return {
+                "accepted": True,
+                "confirmed_open": True,
+                "launch_state": "target_process_running_after_shell_exit",
+            }
         return {
             "accepted": True,
             "confirmed_open": False,
@@ -227,8 +316,17 @@ def shell_execute_open(target_path, wait_ms=2500):
 def open_path(target_path):
     target_path = Path(target_path)
     suffix = target_path.suffix.lower()
-    if suffix in {".lnk", ".exe"}:
-        return shell_execute_open(target_path)
+    if suffix == ".lnk":
+        candidates = extract_lnk_exe_candidates(target_path)
+        process_names = process_names_from_paths(candidates)
+        result = shell_execute_open(target_path, confirm_process_names=process_names)
+        if candidates:
+            result["target_candidates"] = candidates[:5]
+        if process_names:
+            result["target_process_names"] = process_names
+        return result
+    if suffix == ".exe":
+        return shell_execute_open(target_path, confirm_process_names=[target_path.name])
     if target_path.is_dir():
         subprocess.Popen(["explorer.exe", str(target_path)], cwd=str(BASE_DIR), shell=False)
         return {
