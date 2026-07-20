@@ -14,7 +14,7 @@ from controller import BASE_DIR, run_on_host
 
 HOSTS_PATH = BASE_DIR / "hosts.txt"
 AGENT_CONFIG_PATH = BASE_DIR / "agent_config.json"
-APP_VERSION = "2026.07.20-9"
+APP_VERSION = "2026.07.20-10"
 
 
 def read_json(path, default):
@@ -100,6 +100,7 @@ class ControllerApp(tk.Tk):
         self.timeout_var = tk.StringVar(value="180")
         self.summary_var = tk.StringVar(value="等待执行")
         self.host_selected = {}
+        self.discovered_hosts = []
 
         self.create_widgets()
         self.load_state()
@@ -155,6 +156,8 @@ class ControllerApp(tk.Tk):
         ttk.Entry(scan_box, textvariable=self.scan_timeout_var, width=7).grid(row=1, column=2, sticky=tk.EW, padx=(8, 0), pady=(4, 8))
         self.scan_btn = ttk.Button(scan_box, text="自动检索", command=self.scan_agents)
         self.scan_btn.grid(row=1, column=3, sticky=tk.EW, padx=8, pady=(4, 8))
+        self.add_scan_btn = ttk.Button(scan_box, text="添加扫描结果", command=self.add_discovered_hosts)
+        self.add_scan_btn.grid(row=2, column=0, columnspan=4, sticky=tk.EW, padx=8, pady=(0, 8))
         scan_box.columnconfigure(0, weight=1)
 
         ttk.Label(left, text="勾选要操作的主机，单击或按空格切换").pack(anchor=tk.W)
@@ -183,6 +186,7 @@ class ControllerApp(tk.Tk):
         ttk.Button(host_buttons, text="全选", command=self.select_all_hosts).pack(side=tk.LEFT)
         ttk.Button(host_buttons, text="反选", command=self.invert_hosts).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(host_buttons, text="删除", command=self.delete_selected_host).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(host_buttons, text="清空", command=self.clear_hosts).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(host_buttons, text="保存", command=self.save_hosts).pack(side=tk.LEFT, padx=(8, 0))
         self.run_btn = ttk.Button(host_buttons, text="逐台搜索并打开", command=self.run_task)
         self.run_btn.pack(side=tk.RIGHT)
@@ -238,6 +242,29 @@ class ControllerApp(tk.Tk):
             self.refresh_host_row(host)
         return is_new
 
+    def add_discovered_hosts(self):
+        if not self.discovered_hosts:
+            messagebox.showinfo("没有扫描结果", "请先点击自动检索，扫描到被控端后再添加。")
+            return
+        added = 0
+        for host in self.discovered_hosts:
+            if self.add_or_select_host(host):
+                added += 1
+        self.save_hosts(show_status=False)
+        self.summary_var.set(f"已添加扫描结果 {len(self.discovered_hosts)} 台，新增 {added} 台")
+        messagebox.showinfo("添加完成", f"已添加并勾选 {len(self.discovered_hosts)} 台扫描结果，新增 {added} 台。")
+
+    def clear_hosts(self):
+        if not self.host_selected:
+            self.summary_var.set("主机列表已经为空")
+            return
+        if not messagebox.askyesno("确认清空", "确定清空现有已添加的主机列表吗？"):
+            return
+        self.host_tree.delete(*self.host_tree.get_children())
+        self.host_selected = {}
+        self.save_hosts(show_status=False)
+        self.summary_var.set("已清空主机列表")
+
     def scan_agents(self):
         try:
             network = ipaddress.ip_network(self.scan_cidr_var.get().strip(), strict=False)
@@ -256,8 +283,10 @@ class ControllerApp(tk.Tk):
             return
 
         self.scan_btn.configure(state=tk.DISABLED)
+        self.discovered_hosts = []
         self.summary_var.set(f"正在扫描 {network}，共 {len(addresses)} 个地址...")
         self.append_result(f"开始自动检索被控端：{network} 端口 {port}")
+        self.append_result("扫描结果会先输出在这里，点击“添加扫描结果”后才会加入主机列表。")
         thread = threading.Thread(target=self.scan_worker, args=(addresses, port, timeout), daemon=True)
         thread.start()
 
@@ -279,16 +308,17 @@ class ControllerApp(tk.Tk):
         self.after(0, self.finish_scan, found, len(addresses))
 
     def on_agent_found(self, host, agent):
-        is_new = self.add_or_select_host(host)
-        status = "新增" if is_new else "已存在，已勾选"
+        if host not in self.discovered_hosts:
+            self.discovered_hosts.append(host)
+        status = "已在主机列表" if host in self.host_selected else "待添加"
         self.append_result(f"[发现] {host} {agent}（{status}）")
 
     def finish_scan(self, found, total):
         self.scan_btn.configure(state=tk.NORMAL)
-        self.save_hosts(show_status=False)
+        self.discovered_hosts = list(dict.fromkeys(found))
         self.summary_var.set(f"扫描完成，共扫描 {total} 个地址，发现 {len(found)} 台")
         if found:
-            messagebox.showinfo("扫描完成", f"发现 {len(found)} 台被控端，已自动加入并勾选。")
+            messagebox.showinfo("扫描完成", f"发现 {len(found)} 台被控端。确认后可点击“添加扫描结果”加入主机列表。")
         else:
             messagebox.showinfo("扫描完成", "没有发现被控端，请检查网段、端口、防火墙和虚拟机网络模式。")
 
