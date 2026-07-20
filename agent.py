@@ -359,13 +359,51 @@ def shell_execute_open(target_path, wait_ms=2500, confirm_process_names=None):
         ctypes.windll.kernel32.CloseHandle(h_process)
 
 
+def cmd_start_open(target_path):
+    target_path = Path(target_path)
+    cwd = target_path if target_path.is_dir() else target_path.parent
+    batch_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".bat", delete=False, encoding="mbcs") as file:
+            file.write("@echo off\n")
+            file.write(f'cd /d "{cwd}"\n')
+            file.write(f'start "" "{target_path}"\n')
+            file.write("exit /b %ERRORLEVEL%\n")
+            batch_path = file.name
+        process = subprocess.Popen(
+            ["cmd.exe", "/d", "/c", batch_path],
+            cwd=str(cwd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+        )
+        time.sleep(0.7)
+        returncode = process.poll()
+        accepted = returncode is None or returncode == 0
+        return {
+            "accepted": accepted,
+            "confirmed_open": accepted,
+            "launch_state": "cmd_started" if returncode is None else f"cmd_start_returned:{returncode}",
+            "cmd": f'cmd.exe /d /c "{batch_path}"',
+            "cmd_script": f'cd /d "{cwd}" && start "" "{target_path}"',
+            "cmd_stdout": "",
+            "cmd_stderr": "",
+        }
+    finally:
+        if batch_path:
+            try:
+                os.unlink(batch_path)
+            except OSError:
+                pass
+
+
 def open_path(target_path):
     target_path = Path(target_path)
     suffix = target_path.suffix.lower()
     if suffix == ".lnk":
         candidates, shortcut_details = extract_lnk_exe_candidates(target_path)
         process_names = process_names_from_paths(candidates)
-        result = shell_execute_open(target_path, confirm_process_names=process_names)
+        result = cmd_start_open(target_path)
         if candidates:
             result["target_candidates"] = candidates[:5]
         if process_names:
@@ -379,32 +417,40 @@ def open_path(target_path):
         if shortcut_details.get("ShortcutError"):
             result["shortcut_error"] = shortcut_details["ShortcutError"]
         return result
+    result = cmd_start_open(target_path)
     if suffix == ".exe":
-        return shell_execute_open(target_path, confirm_process_names=[target_path.name])
-    if target_path.is_dir():
-        subprocess.Popen(["explorer.exe", str(target_path)], cwd=str(BASE_DIR), shell=False)
-        return {
-            "accepted": True,
-            "confirmed_open": False,
-            "launch_state": "explorer_sent_without_confirmation",
-        }
-    if suffix in {".exe", ".bat", ".cmd"}:
-        subprocess.Popen(
-            ["cmd.exe", "/c", "start", "", str(target_path)],
-            cwd=str(target_path.parent),
-            shell=False,
-        )
-        return {
-            "accepted": True,
-            "confirmed_open": False,
-            "launch_state": "cmd_start_sent_without_confirmation",
-        }
-    os.startfile(str(target_path))
-    return {
-        "accepted": True,
-        "confirmed_open": False,
-        "launch_state": "startfile_sent_without_confirmation",
+        result["target_process_names"] = [target_path.name]
+    return result
+
+
+def build_open_response(run_id, target_path, launch_result):
+    confirmed = bool(launch_result.get("confirmed_open"))
+    stdout_lines = [f"{'CMD open accepted' if confirmed else 'CMD open failed'}: {target_path}"]
+    if launch_result.get("cmd_stdout"):
+        stdout_lines.extend(["CMD STDOUT:", launch_result["cmd_stdout"]])
+    payload = {
+        "ok": confirmed,
+        "accepted": bool(launch_result.get("accepted")),
+        "confirmed_open": confirmed,
+        "launch_state": launch_result.get("launch_state", ""),
+        "cmd": launch_result.get("cmd", ""),
+        "cmd_script": launch_result.get("cmd_script", ""),
+        "run_id": run_id,
+        "returncode": 0 if confirmed else 1,
+        "stdout": "\n".join(stdout_lines),
+        "stderr": launch_result.get("cmd_stderr", ""),
     }
+    for key in (
+        "target_candidates",
+        "target_process_names",
+        "shortcut_target",
+        "shortcut_arguments",
+        "shortcut_working_directory",
+        "shortcut_error",
+    ):
+        if launch_result.get(key):
+            payload[key] = launch_result[key]
+    return payload
 
 
 def run_builtin_open_file(script_name, args, config, run_id):
@@ -441,17 +487,7 @@ def run_builtin_open_file(script_name, args, config, run_id):
             "error": str(exc),
             "stdout": f"Target: {target_path}",
         }
-    confirmed = bool(launch_result.get("confirmed_open"))
-    return 200, {
-        "ok": confirmed,
-        "accepted": bool(launch_result.get("accepted")),
-        "confirmed_open": confirmed,
-        "launch_state": launch_result.get("launch_state", ""),
-        "run_id": run_id,
-        "returncode": 0,
-        "stdout": f"{'Confirmed opened' if confirmed else 'Open command sent but not confirmed'}: {target_path}",
-        "stderr": "",
-    }
+    return 200, build_open_response(run_id, target_path, launch_result)
 
 
 def run_builtin_open_file_search(args, config, run_id):
@@ -492,17 +528,7 @@ def run_builtin_open_file_search(args, config, run_id):
             "error": str(exc),
             "stdout": f"Target: {target_path}",
         }
-    confirmed = bool(launch_result.get("confirmed_open"))
-    return 200, {
-        "ok": confirmed,
-        "accepted": bool(launch_result.get("accepted")),
-        "confirmed_open": confirmed,
-        "launch_state": launch_result.get("launch_state", ""),
-        "run_id": run_id,
-        "returncode": 0,
-        "stdout": f"{'Confirmed opened' if confirmed else 'Open command sent but not confirmed'}: {target_path}",
-        "stderr": "",
-    }
+    return 200, build_open_response(run_id, target_path, launch_result)
 
 
 class AgentHandler(BaseHTTPRequestHandler):
