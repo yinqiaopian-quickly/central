@@ -1,0 +1,6 @@
+这是一个示例文件。
+
+主控端可以通过下面的命令让被控电脑自动打开它：
+
+python controller.py --script open_file --token change-this-token --arg example_text
+

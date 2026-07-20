@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+control_panel.log
+build/
+dist/
+*.spec
+.tools/
+release/
+release_win7/
+release.zip
+release_win7.zip
