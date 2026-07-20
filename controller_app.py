@@ -1,7 +1,12 @@
 import json
+import ipaddress
+import socket
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import messagebox, ttk
 
 from controller import BASE_DIR, run_on_host
@@ -9,7 +14,7 @@ from controller import BASE_DIR, run_on_host
 
 HOSTS_PATH = BASE_DIR / "hosts.txt"
 AGENT_CONFIG_PATH = BASE_DIR / "agent_config.json"
-APP_VERSION = "2026.07.20-8"
+APP_VERSION = "2026.07.20-9"
 
 
 def read_json(path, default):
@@ -44,16 +49,53 @@ def normalize_host(value):
     return value if ":" in value else f"{value}:8765"
 
 
+def get_local_lan_cidr():
+    ip = ""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+    except OSError:
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            ip = ""
+    if not ip or ip.startswith("127."):
+        return "192.168.1.0/24"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return ".".join(parts[:3]) + ".0/24"
+    return "192.168.1.0/24"
+
+
+def check_agent_health(ip, port, timeout):
+    host = f"{ip}:{port}"
+    request = urllib.request.Request(f"http://{host}/health", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("ok"):
+            return host, True, payload
+        return host, False, payload
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        return host, False, {"error": str(exc)}
+
+
 class ControllerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"主控端 {APP_VERSION}")
-        self.geometry("940x640")
-        self.minsize(820, 560)
+        self.geometry("980x720")
+        self.minsize(900, 640)
 
         self.token_var = tk.StringVar()
         self.file_name_var = tk.StringVar()
         self.host_input_var = tk.StringVar()
+        self.scan_cidr_var = tk.StringVar(value=get_local_lan_cidr())
+        self.scan_port_var = tk.StringVar(value="8765")
+        self.scan_timeout_var = tk.StringVar(value="0.6")
         self.interval_var = tk.StringVar(value="5")
         self.timeout_var = tk.StringVar(value="180")
         self.summary_var = tk.StringVar(value="等待执行")
@@ -102,6 +144,18 @@ class ControllerApp(tk.Tk):
         host_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         host_entry.bind("<Return>", lambda _event: self.add_host())
         ttk.Button(add_row, text="添加", command=self.add_host).pack(side=tk.LEFT, padx=(8, 0))
+
+        scan_box = ttk.LabelFrame(left, text="自动检索被控端")
+        scan_box.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(scan_box, text="扫描网段").grid(row=0, column=0, sticky=tk.W, padx=(8, 0), pady=(8, 0))
+        ttk.Label(scan_box, text="端口").grid(row=0, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
+        ttk.Label(scan_box, text="超时秒").grid(row=0, column=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
+        ttk.Entry(scan_box, textvariable=self.scan_cidr_var, width=18).grid(row=1, column=0, sticky=tk.EW, padx=(8, 0), pady=(4, 8))
+        ttk.Entry(scan_box, textvariable=self.scan_port_var, width=7).grid(row=1, column=1, sticky=tk.EW, padx=(8, 0), pady=(4, 8))
+        ttk.Entry(scan_box, textvariable=self.scan_timeout_var, width=7).grid(row=1, column=2, sticky=tk.EW, padx=(8, 0), pady=(4, 8))
+        self.scan_btn = ttk.Button(scan_box, text="自动检索", command=self.scan_agents)
+        self.scan_btn.grid(row=1, column=3, sticky=tk.EW, padx=8, pady=(4, 8))
+        scan_box.columnconfigure(0, weight=1)
 
         ttk.Label(left, text="勾选要操作的主机，单击或按空格切换").pack(anchor=tk.W)
         table_wrap = ttk.Frame(left)
@@ -171,6 +225,72 @@ class ControllerApp(tk.Tk):
             self.summary_var.set(f"已添加主机：{host}")
         self.host_input_var.set("")
         self.save_hosts(show_status=False)
+
+    def add_or_select_host(self, host):
+        host = normalize_host(host)
+        if not host:
+            return False
+        is_new = host not in self.host_selected
+        self.host_selected[host] = True
+        if is_new:
+            self.host_tree.insert("", tk.END, iid=host, values=(self.selected_text(host), host))
+        else:
+            self.refresh_host_row(host)
+        return is_new
+
+    def scan_agents(self):
+        try:
+            network = ipaddress.ip_network(self.scan_cidr_var.get().strip(), strict=False)
+            port = int(self.scan_port_var.get().strip())
+            timeout = max(0.1, float(self.scan_timeout_var.get().strip()))
+        except ValueError:
+            messagebox.showwarning("参数错误", "扫描网段、端口或超时格式不正确，例如 192.168.1.0/24、8765、0.6。")
+            return
+
+        addresses = list(network.hosts())
+        if not addresses:
+            messagebox.showwarning("网段错误", "这个网段没有可扫描的主机地址。")
+            return
+        if len(addresses) > 4096:
+            messagebox.showwarning("网段过大", "请使用较小网段，例如 192.168.1.0/24。")
+            return
+
+        self.scan_btn.configure(state=tk.DISABLED)
+        self.summary_var.set(f"正在扫描 {network}，共 {len(addresses)} 个地址...")
+        self.append_result(f"开始自动检索被控端：{network} 端口 {port}")
+        thread = threading.Thread(target=self.scan_worker, args=(addresses, port, timeout), daemon=True)
+        thread.start()
+
+    def scan_worker(self, addresses, port, timeout):
+        found = []
+        scanned = 0
+        max_workers = min(128, max(8, len(addresses)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(check_agent_health, str(ip), port, timeout) for ip in addresses]
+            for future in as_completed(futures):
+                host, ok, payload = future.result()
+                scanned += 1
+                if ok:
+                    found.append(host)
+                    agent = payload.get("agent", "Agent")
+                    self.after(0, self.on_agent_found, host, agent)
+                if scanned % 32 == 0 or scanned == len(addresses):
+                    self.after(0, self.summary_var.set, f"扫描中 {scanned}/{len(addresses)}，发现 {len(found)} 台")
+        self.after(0, self.finish_scan, found, len(addresses))
+
+    def on_agent_found(self, host, agent):
+        is_new = self.add_or_select_host(host)
+        status = "新增" if is_new else "已存在，已勾选"
+        self.append_result(f"[发现] {host} {agent}（{status}）")
+
+    def finish_scan(self, found, total):
+        self.scan_btn.configure(state=tk.NORMAL)
+        self.save_hosts(show_status=False)
+        self.summary_var.set(f"扫描完成，共扫描 {total} 个地址，发现 {len(found)} 台")
+        if found:
+            messagebox.showinfo("扫描完成", f"发现 {len(found)} 台被控端，已自动加入并勾选。")
+        else:
+            messagebox.showinfo("扫描完成", "没有发现被控端，请检查网段、端口、防火墙和虚拟机网络模式。")
 
     def current_host(self):
         selection = self.host_tree.selection()
