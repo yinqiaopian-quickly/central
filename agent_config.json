@@ -19,6 +19,16 @@
     "open_file_search": {
       "builtin": "open_file_search",
       "timeout_seconds": 60
+    },
+    "riot_login": {
+      "builtin": "riot_login",
+      "timeout_seconds": 60
     }
-  }
+  },
+  "riot_client_executable": "",
+  "riot_window_timeout_seconds": 45,
+  "riot_window_ready_delay_seconds": 5,
+  "riot_login_max_attempts": 3,
+  "riot_username_position": [0.13, 0.285],
+  "riot_input_delay_seconds": 0.03
 }

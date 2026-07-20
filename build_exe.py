@@ -31,6 +31,8 @@ def run_pyinstaller(name, entry):
             "--clean",
             "--onefile",
             "--windowed",
+            "--hidden-import",
+            "encodings.idna",
             "--name",
             name,
             entry,
@@ -62,6 +64,7 @@ def main():
     copy_file(BASE_DIR / "agent_config.json", RELEASE_DIR)
     copy_file(BASE_DIR / "hosts.txt", RELEASE_DIR)
     copy_file(BASE_DIR / "README.md", RELEASE_DIR)
+    copy_file(BASE_DIR / "使用教程.txt", RELEASE_DIR)
     copy_tree(BASE_DIR / "scripts", RELEASE_DIR / "scripts")
 
     print(f"Built release package: {RELEASE_DIR}")

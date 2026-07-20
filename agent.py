@@ -5,13 +5,19 @@ import io
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
+from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from secure_payload import SecurePayloadError, decrypt_riot_login_request, verify_request_authentication
 
 
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -21,6 +27,383 @@ SEE_MASK_NOCLOSEPROCESS = 0x00000040
 SW_SHOWNORMAL = 1
 WAIT_TIMEOUT = 0x00000102
 STILL_ACTIVE = 259
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SW_RESTORE = 9
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_SHOWWINDOW = 0x0040
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+VK_CONTROL = 0x11
+VK_MENU = 0x12
+VK_RETURN = 0x0D
+VK_TAB = 0x09
+VK_A = 0x41
+ULONG_PTR = wintypes.WPARAM
+USER32 = ctypes.WinDLL("user32", use_last_error=True)
+KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+RIOT_INPUT_LOCK = threading.Lock()
+RECENT_LOGIN_LOCK = threading.Lock()
+RECENT_LOGIN_SIGNATURES = {}
+
+
+class MouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class KeyboardInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class HardwareInput(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class InputValue(ctypes.Union):
+    _fields_ = [("mi", MouseInput), ("ki", KeyboardInput), ("hi", HardwareInput)]
+
+
+class Input(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [("type", wintypes.DWORD), ("value", InputValue)]
+
+
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def keyboard_event(virtual_key=0, scan_code=0, flags=0):
+    event = Input()
+    event.type = INPUT_KEYBOARD
+    event.ki = KeyboardInput(virtual_key, scan_code, flags, 0, 0)
+    return event
+
+
+def mouse_event(flags):
+    event = Input()
+    event.type = INPUT_MOUSE
+    event.mi = MouseInput(0, 0, 0, flags, 0, 0)
+    return event
+
+
+def send_input_events(events):
+    if not events:
+        return
+    array = (Input * len(events))(*events)
+    sent = USER32.SendInput(len(events), array, ctypes.sizeof(Input))
+    if sent != len(events):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def press_virtual_key(virtual_key):
+    send_input_events(
+        [
+            keyboard_event(virtual_key=virtual_key),
+            keyboard_event(virtual_key=virtual_key, flags=KEYEVENTF_KEYUP),
+        ]
+    )
+
+
+def select_all_text():
+    send_input_events(
+        [
+            keyboard_event(virtual_key=VK_CONTROL),
+            keyboard_event(virtual_key=VK_A),
+            keyboard_event(virtual_key=VK_A, flags=KEYEVENTF_KEYUP),
+            keyboard_event(virtual_key=VK_CONTROL, flags=KEYEVENTF_KEYUP),
+        ]
+    )
+
+
+def send_unicode_text(value, delay_seconds):
+    encoded = value.encode("utf-16-le")
+    for (code_unit,) in struct.iter_unpack("<H", encoded):
+        send_input_events(
+            [
+                keyboard_event(scan_code=code_unit, flags=KEYEVENTF_UNICODE),
+                keyboard_event(scan_code=code_unit, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+            ]
+        )
+        if delay_seconds:
+            time.sleep(delay_seconds)
+
+
+def get_window_text(hwnd):
+    length = USER32.GetWindowTextLengthW(hwnd)
+    value = ctypes.create_unicode_buffer(length + 1)
+    USER32.GetWindowTextW(hwnd, value, len(value))
+    return value.value
+
+
+def get_window_class(hwnd):
+    value = ctypes.create_unicode_buffer(256)
+    USER32.GetClassNameW(hwnd, value, len(value))
+    return value.value
+
+
+def get_window_process_path(hwnd):
+    process_id = wintypes.DWORD()
+    USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+    process = KERNEL32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, process_id.value)
+    if not process:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        value = ctypes.create_unicode_buffer(size.value)
+        if not KERNEL32.QueryFullProcessImageNameW(process, 0, value, ctypes.byref(size)):
+            return ""
+        return value.value
+    finally:
+        KERNEL32.CloseHandle(process)
+
+
+def find_riot_window():
+    candidates = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def callback(hwnd, _lparam):
+        if not USER32.IsWindowVisible(hwnd):
+            return True
+        title = get_window_text(hwnd)
+        class_name = get_window_class(hwnd)
+        if title.lower() != "riot client" or class_name != "Chrome_WidgetWin_1":
+            return True
+        process_path = get_window_process_path(hwnd)
+        if Path(process_path).name.lower() != "riot client.exe":
+            return True
+        candidates.append(
+            {
+                "hwnd": int(hwnd),
+                "title": title,
+                "class_name": class_name,
+                "process_path": process_path,
+            }
+        )
+        return True
+
+    USER32.EnumWindows(callback, 0)
+    return candidates[0] if candidates else None
+
+
+def wait_for_riot_window(timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() <= deadline:
+        window = find_riot_window()
+        if window:
+            return window
+        time.sleep(0.5)
+    return None
+
+
+def wait_for_stable_riot_window(timeout_seconds, stable_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    stable_hwnd = None
+    stable_since = 0
+    while time.monotonic() <= deadline:
+        window = find_riot_window()
+        if window and window["hwnd"] == stable_hwnd:
+            if time.monotonic() - stable_since >= stable_seconds:
+                return window
+        elif window:
+            stable_hwnd = window["hwnd"]
+            stable_since = time.monotonic()
+        else:
+            stable_hwnd = None
+            stable_since = 0
+        time.sleep(0.25)
+    return None
+
+
+def stop_riot_client_processes():
+    for process_name in ("Riot Client.exe", "RiotClientServices.exe"):
+        subprocess.run(
+            ["taskkill.exe", "/f", "/im", process_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    deadline = time.monotonic() + 8
+    while time.monotonic() <= deadline:
+        if not any_process_running(["Riot Client.exe", "RiotClientServices.exe"]):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def activate_window(hwnd):
+    if not USER32.IsWindow(hwnd):
+        return False
+    USER32.ShowWindow(hwnd, SW_RESTORE)
+    USER32.BringWindowToTop(hwnd)
+
+    current_thread = KERNEL32.GetCurrentThreadId()
+    target_thread = USER32.GetWindowThreadProcessId(hwnd, None)
+    foreground = USER32.GetForegroundWindow()
+    foreground_thread = USER32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    attached_threads = []
+    for thread_id in {target_thread, foreground_thread}:
+        if thread_id and thread_id != current_thread:
+            if USER32.AttachThreadInput(current_thread, thread_id, True):
+                attached_threads.append(thread_id)
+    try:
+        press_virtual_key(VK_MENU)
+        USER32.BringWindowToTop(hwnd)
+        USER32.SetWindowPos(
+            hwnd,
+            ctypes.c_void_p(-1),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+        USER32.SetForegroundWindow(hwnd)
+        USER32.SetActiveWindow(hwnd)
+        USER32.SetFocus(hwnd)
+        USER32.SetWindowPos(
+            hwnd,
+            ctypes.c_void_p(-2),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+    finally:
+        for thread_id in attached_threads:
+            USER32.AttachThreadInput(current_thread, thread_id, False)
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() <= deadline:
+        if USER32.GetForegroundWindow() == hwnd:
+            return True
+        USER32.SetForegroundWindow(hwnd)
+        time.sleep(0.1)
+    return False
+
+
+def riot_window_has_foreground(hwnd):
+    foreground = USER32.GetForegroundWindow()
+    if not foreground:
+        return False
+    if foreground == hwnd:
+        return True
+    return Path(get_window_process_path(foreground)).name.lower() == "riot client.exe"
+
+
+def config_position(config, key, default):
+    value = config.get(key, default)
+    if not isinstance(value, list) or len(value) != 2:
+        return default
+    try:
+        x_ratio, y_ratio = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return default
+    if not 0 <= x_ratio <= 1 or not 0 <= y_ratio <= 1:
+        return default
+    return x_ratio, y_ratio
+
+
+def client_screen_point(hwnd, position):
+    rect = wintypes.RECT()
+    if not USER32.GetClientRect(hwnd, ctypes.byref(rect)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width < 600 or height < 400:
+        raise RuntimeError(f"Riot Client window is too small: {width}x{height}")
+    point = wintypes.POINT(int(width * position[0]), int(height * position[1]))
+    if not USER32.ClientToScreen(hwnd, ctypes.byref(point)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return point
+
+
+def click_screen_point(point):
+    if not USER32.SetCursorPos(point.x, point.y):
+        raise ctypes.WinError(ctypes.get_last_error())
+    send_input_events([mouse_event(MOUSEEVENTF_LEFTDOWN), mouse_event(MOUSEEVENTF_LEFTUP)])
+
+
+def input_riot_credentials(window, username, password, config):
+    hwnd = window["hwnd"]
+    activate_window(hwnd)
+    if not USER32.IsWindow(hwnd):
+        raise RuntimeError("cannot_activate_riot_window")
+
+    username_position = config_position(config, "riot_username_position", [0.13, 0.285])
+    delay_seconds = min(0.2, max(0, float(config.get("riot_input_delay_seconds", 0.03))))
+    username_point = client_screen_point(hwnd, username_position)
+    original_cursor = wintypes.POINT()
+    has_cursor = bool(USER32.GetCursorPos(ctypes.byref(original_cursor)))
+
+    try:
+        activate_window(hwnd)
+        click_screen_point(username_point)
+        time.sleep(0.15)
+        if not riot_window_has_foreground(hwnd):
+            activate_window(hwnd)
+            click_screen_point(username_point)
+            time.sleep(0.15)
+        if not riot_window_has_foreground(hwnd):
+            raise RuntimeError("cannot_focus_riot_username")
+        select_all_text()
+        send_unicode_text(username, delay_seconds)
+
+        if not USER32.IsWindow(hwnd):
+            raise RuntimeError("riot_window_recreated")
+        if not riot_window_has_foreground(hwnd):
+            raise RuntimeError("riot_window_lost_focus_after_username")
+        press_virtual_key(VK_TAB)
+        time.sleep(0.2)
+        if not riot_window_has_foreground(hwnd):
+            raise RuntimeError("riot_window_lost_focus_before_password")
+        select_all_text()
+        send_unicode_text(password, delay_seconds)
+        time.sleep(0.15)
+        press_virtual_key(VK_RETURN)
+    finally:
+        if has_cursor:
+            USER32.SetCursorPos(original_cursor.x, original_cursor.y)
+
+
+def remember_request_signature(signature):
+    now = time.time()
+    with RECENT_LOGIN_LOCK:
+        expired = [value for value, created_at in RECENT_LOGIN_SIGNATURES.items() if now - created_at > 180]
+        for value in expired:
+            RECENT_LOGIN_SIGNATURES.pop(value, None)
+        if signature in RECENT_LOGIN_SIGNATURES:
+            return False
+        RECENT_LOGIN_SIGNATURES[signature] = now
+        return True
 
 
 class ShellExecuteInfo(ctypes.Structure):
@@ -73,6 +456,45 @@ def expand_config_path(value):
     if not path.is_absolute():
         path = BASE_DIR / path
     return path
+
+
+def find_riot_client_executable(config):
+    candidates = []
+    configured_path = config.get("riot_client_executable")
+    if configured_path:
+        candidates.append(expand_config_path(configured_path))
+
+    program_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
+    metadata_path = program_data / "Riot Games" / "RiotClientInstalls.json"
+    if metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8-sig") as file:
+                metadata = json.load(file)
+            for key in ("rc_default", "rc_live"):
+                if metadata.get(key):
+                    candidates.append(Path(metadata[key]))
+            for group_name in ("patchlines", "associated_client"):
+                group = metadata.get(group_name, {})
+                if isinstance(group, dict):
+                    candidates.extend(Path(value) for value in group.values() if isinstance(value, str))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    drive_mask = KERNEL32.GetLogicalDrives()
+    for index in range(26):
+        if drive_mask & (1 << index):
+            drive = chr(ord("A") + index)
+            candidates.append(Path(f"{drive}:\\Riot Games\\Riot Client\\RiotClientServices.exe"))
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file() and candidate.name.lower() == "riotclientservices.exe":
+            return candidate
+    return None
 
 
 def candidate_search_roots(config):
@@ -531,8 +953,105 @@ def run_builtin_open_file_search(args, config, run_id):
     return 200, build_open_response(run_id, target_path, launch_result)
 
 
+def run_builtin_riot_login(args, config, run_id):
+    if len(args) != 2 or not args[0] or not args[1]:
+        return 400, {"ok": False, "run_id": run_id, "error": "missing_riot_credentials"}
+    username, password = args
+    if len(username) > 320 or len(password) > 320:
+        return 400, {"ok": False, "run_id": run_id, "error": "riot_credentials_too_long"}
+
+    timeout_seconds = min(120, max(1, int(config.get("riot_window_timeout_seconds", 45))))
+    stable_seconds = min(15, max(1, float(config.get("riot_window_ready_delay_seconds", 5))))
+    max_attempts = min(5, max(1, int(config.get("riot_login_max_attempts", 3))))
+    riot_executable = find_riot_client_executable(config)
+    if not riot_executable:
+        return 404, {
+            "ok": False,
+            "run_id": run_id,
+            "error": "riot_client_executable_not_found",
+            "stderr": "未找到 RiotClientServices.exe，请在 agent_config.json 中配置 riot_client_executable。",
+        }
+
+    launch_result = None
+    last_error = "riot_window_not_found"
+    last_window = None
+    with RIOT_INPUT_LOCK:
+        window = find_riot_window()
+        for attempt in range(1, max_attempts + 1):
+            if window:
+                window = wait_for_stable_riot_window(stable_seconds + 3, stable_seconds)
+            if not window:
+                if any_process_running(["RiotClientServices.exe", "Riot Client.exe"]):
+                    stop_riot_client_processes()
+                    time.sleep(0.5)
+                try:
+                    launch_result = open_path(riot_executable)
+                except OSError as exc:
+                    last_error = str(exc)
+                    window = None
+                    continue
+                window = wait_for_stable_riot_window(timeout_seconds, stable_seconds)
+            if not window:
+                last_error = "riot_window_not_found"
+                continue
+
+            last_window = window
+            try:
+                input_riot_credentials(window, username, password, config)
+                break
+            except (OSError, RuntimeError, ValueError) as exc:
+                last_error = str(exc)
+                window = None
+                if attempt < max_attempts:
+                    stop_riot_client_processes()
+                    time.sleep(0.5)
+        else:
+            foreground = USER32.GetForegroundWindow()
+            payload = {
+                "ok": False,
+                "run_id": run_id,
+                "error": last_error,
+                "attempts": max_attempts,
+                "stderr": "Riot Client 窗口未能保持稳定，已完成自动重启和重新捕获。",
+            }
+            if foreground:
+                payload.update(
+                    {
+                        "foreground_handle": int(foreground),
+                        "foreground_title": get_window_text(foreground),
+                        "foreground_class": get_window_class(foreground),
+                        "foreground_process": get_window_process_path(foreground),
+                    }
+                )
+            if last_window:
+                payload.update(
+                    {
+                        "window_handle": last_window["hwnd"],
+                        "window_title": last_window["title"],
+                        "window_class": last_window["class_name"],
+                    }
+                )
+            return 409, payload
+
+    payload = {
+        "ok": True,
+        "run_id": run_id,
+        "login_state": "credentials_submitted",
+        "window_handle": window["hwnd"],
+        "window_title": window["title"],
+        "window_class": window["class_name"],
+        "attempts": attempt,
+        "window_stable_seconds": stable_seconds,
+        "stdout": "已捕获 Riot Client 窗口句柄并提交账号密码。",
+    }
+    payload["riot_executable"] = str(riot_executable)
+    if launch_result:
+        payload["launch_state"] = launch_result.get("launch_state", "")
+    return 200, payload
+
+
 class AgentHandler(BaseHTTPRequestHandler):
-    server_version = "LanScriptAgent/1.0"
+    server_version = "LanScriptAgent/1.5"
 
     def do_GET(self):
         if self.path != "/health":
@@ -545,22 +1064,53 @@ class AgentHandler(BaseHTTPRequestHandler):
             json_response(self, 404, {"ok": False, "error": "not_found"})
             return
 
-        config = load_config()
-        token = self.headers.get("X-Agent-Token", "")
-        if token != config.get("token"):
-            json_response(self, 401, {"ok": False, "error": "unauthorized"})
-            return
-
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length).decode("utf-8")
-            payload = json.loads(body or "{}")
-        except (ValueError, json.JSONDecodeError):
+            if length <= 0 or length > 65536:
+                raise ValueError("invalid_content_length")
+            body = self.rfile.read(length)
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             json_response(self, 400, {"ok": False, "error": "invalid_json"})
             return
 
+        config = load_config()
         script_name = payload.get("script")
-        args = payload.get("args", [])
+        if script_name == "riot_login":
+            issued_at = self.headers.get("X-Agent-Timestamp", "")
+            signature = self.headers.get("X-Agent-Signature", "")
+            try:
+                username, password = decrypt_riot_login_request(
+                    config.get("token", ""), body, issued_at, signature
+                )
+            except SecurePayloadError as exc:
+                json_response(self, 401, {"ok": False, "error": str(exc)})
+                return
+            if not remember_request_signature(signature):
+                json_response(self, 409, {"ok": False, "error": "replayed_request"})
+                return
+            args = [username, password]
+        else:
+            issued_at = self.headers.get("X-Agent-Timestamp", "")
+            request_nonce = self.headers.get("X-Agent-Nonce", "")
+            signature = self.headers.get("X-Agent-Signature", "")
+            if signature:
+                try:
+                    verify_request_authentication(
+                        config.get("token", ""), body, issued_at, request_nonce, signature
+                    )
+                except SecurePayloadError as exc:
+                    json_response(self, 401, {"ok": False, "error": str(exc)})
+                    return
+                if not remember_request_signature(signature):
+                    json_response(self, 409, {"ok": False, "error": "replayed_request"})
+                    return
+            else:
+                token = self.headers.get("X-Agent-Token", "")
+                if token != config.get("token"):
+                    json_response(self, 401, {"ok": False, "error": "unauthorized"})
+                    return
+            args = payload.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             json_response(self, 400, {"ok": False, "error": "args_must_be_string_array"})
             return
@@ -578,6 +1128,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         if script.get("builtin") == "open_file_search":
             status, result = run_builtin_open_file_search(args, config, run_id)
+            json_response(self, status, result)
+            return
+        if script.get("builtin") == "riot_login":
+            status, result = run_builtin_riot_login(args, config, run_id)
             json_response(self, status, result)
             return
 
@@ -632,7 +1186,7 @@ def main():
     if not CONFIG_PATH.exists():
         raise SystemExit(f"Missing config: {CONFIG_PATH}")
 
-    server = ThreadingHTTPServer((args.host, args.port), AgentHandler)
+    server = ExclusiveThreadingHTTPServer((args.host, args.port), AgentHandler)
     print(f"Agent listening on http://{args.host}:{args.port}")
     server.serve_forever()
 

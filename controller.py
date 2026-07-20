@@ -1,4 +1,6 @@
 import argparse
+import codecs
+import encodings.idna
 import json
 import sys
 import urllib.error
@@ -6,8 +8,24 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from secure_payload import create_request_authentication, create_riot_login_request
+
 
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+
+def register_required_codecs():
+    def search_function(encoding_name):
+        normalized = encoding_name.replace("-", "_").lower()
+        if normalized == "idna":
+            return encodings.idna.getregentry()
+        return None
+
+    codecs.register(search_function)
+    codecs.lookup("idna")
+
+
+register_required_codecs()
 
 
 def load_hosts(path):
@@ -23,13 +41,43 @@ def load_hosts(path):
 def run_on_host(host, token, script, script_args, timeout):
     url = f"http://{host}/run"
     body = json.dumps({"script": script, "args": script_args}).encode("utf-8")
+    issued_at, request_nonce, signature = create_request_authentication(token, body)
     request = urllib.request.Request(
         url,
         data=body,
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "X-Agent-Token": token,
+            "X-Agent-Timestamp": issued_at,
+            "X-Agent-Nonce": request_nonce,
+            "X-Agent-Signature": signature,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return host, response.status, payload
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except json.JSONDecodeError:
+            payload = {"ok": False, "error": exc.reason}
+        return host, exc.code, payload
+    except Exception as exc:
+        return host, 0, {"ok": False, "error": str(exc)}
+
+
+def run_riot_login_on_host(host, token, username, password, timeout):
+    url = f"http://{host}/run"
+    body, issued_at, signature = create_riot_login_request(token, username, password)
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Agent-Timestamp": issued_at,
+            "X-Agent-Signature": signature,
         },
     )
     try:

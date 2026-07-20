@@ -1,16 +1,18 @@
 import queue
 import threading
 import tkinter as tk
-from http.server import ThreadingHTTPServer
 from tkinter import messagebox, ttk
 
-from agent import AgentHandler, CONFIG_PATH
+from agent import AgentHandler, CONFIG_PATH, ExclusiveThreadingHTTPServer
+
+
+APP_VERSION = "2026.07.20-21"
 
 
 class AgentApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("被控端 Agent")
+        self.title(f"被控端 Agent {APP_VERSION}")
         self.geometry("620x430")
         self.minsize(560, 380)
 
@@ -30,7 +32,7 @@ class AgentApp(tk.Tk):
         root = ttk.Frame(self, padding=16)
         root.pack(fill=tk.BOTH, expand=True)
 
-        title = ttk.Label(root, text="被控端 Agent", font=("Microsoft YaHei UI", 16, "bold"))
+        title = ttk.Label(root, text=f"被控端 Agent {APP_VERSION}", font=("Microsoft YaHei UI", 16, "bold"))
         title.pack(anchor=tk.W)
 
         subtitle = ttk.Label(root, text="启动后接收主控端请求，只执行 agent_config.json 中登记的白名单脚本。")
@@ -82,7 +84,7 @@ class AgentApp(tk.Tk):
         try:
             port = int(self.port_var.get())
             host = self.host_var.get().strip() or "0.0.0.0"
-            self.server = ThreadingHTTPServer((host, port), AgentHandler)
+            self.server = ExclusiveThreadingHTTPServer((host, port), AgentHandler)
         except Exception as exc:
             self.server = None
             messagebox.showerror("启动失败", str(exc))
@@ -114,4 +116,3 @@ class AgentApp(tk.Tk):
 
 if __name__ == "__main__":
     AgentApp().mainloop()
-
