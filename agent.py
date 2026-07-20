@@ -5,7 +5,6 @@ import subprocess
 import sys
 import time
 import uuid
-import ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -162,16 +161,11 @@ def open_path(target_path):
     target_path = Path(target_path)
     suffix = target_path.suffix.lower()
     if suffix == ".lnk":
-        result = ctypes.windll.shell32.ShellExecuteW(
-            None,
-            "open",
-            str(target_path),
-            None,
-            str(target_path.parent),
-            1,
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", "", str(target_path)],
+            cwd=str(target_path.parent),
+            shell=False,
         )
-        if result <= 32:
-            raise OSError(f"ShellExecute failed: {result}")
         return
     if target_path.is_dir():
         subprocess.Popen(["explorer.exe", str(target_path)], cwd=str(BASE_DIR), shell=False)

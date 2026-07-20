@@ -5,52 +5,20 @@
     ".",
     "%USERPROFILE%\\Desktop",
     "%USERPROFILE%\\Documents",
-    "%USERPROFILE%\\Downloads"
+    "%USERPROFILE%\\Downloads",
+    "%PUBLIC%\\Desktop",
+    "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs",
+    "%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs",
+    "%PROGRAMFILES%",
+    "%PROGRAMFILES(X86)%"
   ],
-  "file_search_max_seconds": 20,
-  "file_search_max_matches": 200,
+  "file_search_max_seconds": 45,
+  "file_search_max_dirs": 5000,
+  "file_search_max_results": 20,
   "scripts": {
-    "hello": {
-      "command": [
-        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        "scripts/hello.ps1"
-      ],
-      "timeout_seconds": 30
-    },
-    "open_file": {
-      "command": [
-        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        "scripts/open_file.ps1"
-      ],
-      "timeout_seconds": 30
-    },
-    "hello_bat": {
-      "command": [
-        "C:\\Windows\\System32\\cmd.exe",
-        "/c",
-        "scripts\\hello.bat"
-      ],
-      "timeout_seconds": 30
-    },
-    "open_file_bat": {
-      "command": [
-        "C:\\Windows\\System32\\cmd.exe",
-        "/c",
-        "scripts\\open_file.bat"
-      ],
-      "timeout_seconds": 30
-    },
-    "open_file_auto": {
-      "builtin": "open_file",
-      "timeout_seconds": 30
+    "open_file_search": {
+      "builtin": "open_file_search",
+      "timeout_seconds": 60
     }
   }
 }

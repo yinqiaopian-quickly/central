@@ -9,6 +9,7 @@ from controller import BASE_DIR, run_on_host
 
 HOSTS_PATH = BASE_DIR / "hosts.txt"
 AGENT_CONFIG_PATH = BASE_DIR / "agent_config.json"
+APP_VERSION = "2026.07.20-2"
 
 
 def read_json(path, default):
@@ -34,6 +35,10 @@ def read_hosts():
 
 def normalize_host(value):
     value = value.strip()
+    for prefix in ("http://", "https://"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+    value = value.split("/", 1)[0]
     if not value:
         return ""
     return value if ":" in value else f"{value}:8765"
@@ -42,7 +47,7 @@ def normalize_host(value):
 class ControllerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("主控端")
+        self.title(f"主控端 {APP_VERSION}")
         self.geometry("940x640")
         self.minsize(820, 560)
 
@@ -63,7 +68,7 @@ class ControllerApp(tk.Tk):
 
         header = ttk.Frame(root)
         header.pack(fill=tk.X)
-        ttk.Label(header, text="主控端", font=("Microsoft YaHei UI", 16, "bold")).pack(side=tk.LEFT)
+        ttk.Label(header, text=f"主控端 {APP_VERSION}", font=("Microsoft YaHei UI", 16, "bold")).pack(side=tk.LEFT)
         ttk.Button(header, text="刷新配置", command=self.load_state).pack(side=tk.RIGHT)
 
         body = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
@@ -98,7 +103,7 @@ class ControllerApp(tk.Tk):
         host_entry.bind("<Return>", lambda _event: self.add_host())
         ttk.Button(add_row, text="添加", command=self.add_host).pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(left, text="勾选要操作的主机，双击或按空格切换").pack(anchor=tk.W)
+        ttk.Label(left, text="勾选要操作的主机，单击或按空格切换").pack(anchor=tk.W)
         table_wrap = ttk.Frame(left)
         table_wrap.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
         self.host_tree = ttk.Treeview(
@@ -116,7 +121,7 @@ class ControllerApp(tk.Tk):
         scrollbar = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=self.host_tree.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.host_tree.configure(yscrollcommand=scrollbar.set)
-        self.host_tree.bind("<Double-1>", lambda _event: self.toggle_selected_host())
+        self.host_tree.bind("<ButtonRelease-1>", self.on_host_click)
         self.host_tree.bind("<space>", lambda _event: self.toggle_selected_host())
 
         host_buttons = ttk.Frame(left)
@@ -170,6 +175,14 @@ class ControllerApp(tk.Tk):
     def current_host(self):
         selection = self.host_tree.selection()
         return selection[0] if selection else ""
+
+    def on_host_click(self, event):
+        row_id = self.host_tree.identify_row(event.y)
+        if not row_id:
+            return
+        self.host_tree.selection_set(row_id)
+        self.host_selected[row_id] = not self.host_selected.get(row_id, False)
+        self.refresh_host_row(row_id)
 
     def toggle_selected_host(self):
         host = self.current_host()
@@ -253,31 +266,44 @@ class ControllerApp(tk.Tk):
         total = len(hosts)
         for index, host in enumerate(hosts, start=1):
             self.after(0, self.append_result, f"正在执行第 {index}/{total} 台：{host}")
-            host, status, payload = run_on_host(host, token, "open_file_search", [filename], timeout)
+            try:
+                host, status, payload = run_on_host(host, token, "open_file_search", [filename], timeout)
+            except Exception as exc:
+                status = 0
+                payload = {"ok": False, "error": f"主控端异常: {exc}"}
             results.append((host, status, payload))
             self.after(0, self.render_one_result, host, status, payload)
             if index < total and interval > 0:
                 self.after(0, self.append_result, f"等待 {interval:g} 秒后执行下一台...\n")
                 time.sleep(interval)
         ok_count = sum(1 for _host, _status, payload in results if payload.get("ok"))
-        self.after(0, self.finish_run, len(results), ok_count)
+        self.after(0, self.finish_run, results, ok_count)
+
+    def format_result_block(self, host, status, payload):
+        ok = "OK" if payload.get("ok") else "FAIL"
+        lines = [f"[{ok}] {host} HTTP={status}"]
+        if payload.get("stdout"):
+            lines.extend(["STDOUT:", payload["stdout"].rstrip()])
+        if payload.get("stderr"):
+            lines.extend(["STDERR:", payload["stderr"].rstrip()])
+        if payload.get("error"):
+            lines.append(f"ERROR: {payload['error']}")
+        return "\n".join(lines)
 
     def render_one_result(self, host, status, payload):
-        ok = "OK" if payload.get("ok") else "FAIL"
-        self.append_result(f"[{ok}] {host} HTTP={status}")
-        if payload.get("stdout"):
-            self.append_result("STDOUT:")
-            self.append_result(payload["stdout"].rstrip())
-        if payload.get("stderr"):
-            self.append_result("STDERR:")
-            self.append_result(payload["stderr"].rstrip())
-        if payload.get("error"):
-            self.append_result(f"ERROR: {payload['error']}")
+        self.append_result(self.format_result_block(host, status, payload))
         self.append_result("")
 
-    def finish_run(self, total, ok_count):
+    def finish_run(self, results, ok_count):
+        total = len(results)
+        fail_count = total - ok_count
         self.summary_var.set(f"完成 {total} 台，成功 {ok_count} 台，失败 {total - ok_count} 台")
         self.run_btn.configure(state=tk.NORMAL)
+        if fail_count:
+            failed = [self.format_result_block(host, status, payload) for host, status, payload in results if not payload.get("ok")]
+            messagebox.showerror("执行失败", "\n\n".join(failed[:5]))
+        else:
+            messagebox.showinfo("执行完成", f"成功打开 {ok_count} 台。")
 
 
 if __name__ == "__main__":
