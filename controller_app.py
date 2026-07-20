@@ -9,7 +9,7 @@ from controller import BASE_DIR, run_on_host
 
 HOSTS_PATH = BASE_DIR / "hosts.txt"
 AGENT_CONFIG_PATH = BASE_DIR / "agent_config.json"
-APP_VERSION = "2026.07.20-7"
+APP_VERSION = "2026.07.20-8"
 
 
 def read_json(path, default):
@@ -289,10 +289,6 @@ class ControllerApp(tk.Tk):
         lines = [f"[{ok}] {host} HTTP={status}"]
         if payload.get("launch_state"):
             lines.append(f"启动状态: {payload['launch_state']}")
-        if payload.get("activation_method"):
-            lines.append(f"模拟方式: {payload['activation_method']}")
-        if payload.get("activation_script"):
-            lines.append(f"模拟操作: {payload['activation_script']}")
         if payload.get("cmd"):
             lines.append(f"执行命令: {payload['cmd']}")
         if payload.get("cmd_script"):
